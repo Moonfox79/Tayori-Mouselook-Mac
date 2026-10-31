@@ -1,0 +1,10 @@
+{
+  "python_syntax": "PASS",
+  "workflow_structure": "PASS: manual only, public only, standard runner, contents read",
+  "tested_windows_fixes_included": "PASS: instant Mouselook, live target position and callback signature",
+  "source_archive": "PASS: includes new files, excludes unrelated files",
+  "macOS_build": "NOT_RUN",
+  "M3_Tahoe_runtime": "NOT_TESTED",
+  "clean_patch_apply_reverse": "PASS",
+  "status_text_conversions": "PASS: all three explicit std::string calls"
+}

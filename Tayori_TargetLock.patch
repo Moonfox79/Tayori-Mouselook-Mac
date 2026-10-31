@@ -1,0 +1,407 @@
+diff --git a/indra/newview/CMakeLists.txt b/indra/newview/CMakeLists.txt
+index e9cf471..7436f72 100644
+--- a/indra/newview/CMakeLists.txt
++++ b/indra/newview/CMakeLists.txt
+@@ -141,6 +141,7 @@ set(viewer_SOURCE_FILES
+     fsfloaterposer.cpp
+     fsfloaterposestand.cpp
+     fsfloaterprotectedfolders.cpp
++    fsfloatertargetlock.cpp
+     fsfloaterradar.cpp
+     fsfloatersearch.cpp
+     fsfloatersplashscreensettings.cpp
+@@ -1011,6 +1012,8 @@ set(viewer_HEADER_FILES
+     fsfloaterposer.h
+     fsfloaterposestand.h
+     fsfloaterprotectedfolders.h
++    fsfloatertargetlock.h
++    tayoriaim.h
+     fsfloaterradar.h
+     fsfloatersearch.h
+     fsfloatersplashscreensettings.h
+diff --git a/indra/newview/fsfloatertargetlock.cpp b/indra/newview/fsfloatertargetlock.cpp
+new file mode 100644
+index 0000000..999007a
+--- /dev/null
++++ b/indra/newview/fsfloatertargetlock.cpp
+@@ -0,0 +1,175 @@
++// SPDX-License-Identifier: LGPL-2.1-only
++// Independently authored prototype; no code copied from private viewer forks.
++#include "llviewerprecompiledheaders.h"
++#include "fsfloatertargetlock.h"
++#include "tayoriaim.h"
++#include "llagent.h"
++#include "llagentcamera.h"
++#include "llavatarnamecache.h"
++#include "llbutton.h"
++#include "llfocusmgr.h"
++#include "llfloaterreg.h"
++#include "lljoint.h"
++#include "llscrolllistctrl.h"
++#include "lltextbox.h"
++#include "llviewerobjectlist.h"
++#include "llviewerregion.h"
++#include "llvoavatarself.h"
++#include "llworld.h"
++#include <algorithm>
++#include <string>
++#include <vector>
++
++namespace
++{
++LLUUID target_id;
++LLUUID source_region;
++bool was_mouselook = false;
++constexpr F32 RANGE = 96.f;
++LLVOAvatar* targetAvatar(const LLUUID& id)
++{
++    LLViewerObject* object = gObjectList.findObject(id);
++    if (!object || object->isDead() || !object->isAvatar()) return nullptr;
++    return object->asAvatar();
++}
++}
++
++FSFloaterTargetLock::FSFloaterTargetLock(const LLSD& key) : LLFloater(key) {}
++bool FSFloaterTargetLock::postBuild()
++{
++    mList = getChild<LLScrollListCtrl>("targets");
++    mList->setCommitOnSelectionChange(true);
++    mList->setCommitCallback([this](LLUICtrl*, const LLSD&) { selectTarget(); });
++    getChild<LLButton>("stop")->setClickedCallback([](LLUICtrl*, const LLSD&) { stop(); });
++    return true;
++}
++void FSFloaterTargetLock::onOpen(const LLSD& key)
++{
++    LLFloater::onOpen(key);
++    refresh();
++}
++void FSFloaterTargetLock::onClose(bool app_quitting)
++{
++    stop();
++    LLFloater::onClose(app_quitting);
++}
++void FSFloaterTargetLock::draw()
++{
++    if (mRefreshTimer.getElapsedTimeF32() >= 5.f) refresh();
++    LLFloater::draw();
++}
++void FSFloaterTargetLock::refresh()
++{
++    if (!mList) return;
++    mRefreshing = true;
++    const LLUUID selected = mList->getSelectedValue().asUUID();
++    mList->deleteAllItems();
++    uuid_vec_t ids;
++    std::vector<LLVector3d> positions;
++    LLWorld::getInstance()->getAvatars(&ids, &positions, gAgent.getPositionGlobal(), RANGE);
++    struct Entry { LLUUID id; F64 distance; std::string name; bool loaded; };
++    std::vector<Entry> entries;
++    const size_t count = std::min(ids.size(), positions.size());
++    for (size_t i = 0; i < count; ++i)
++    {
++        if (ids[i] == gAgent.getID()) continue;
++        LLAvatarName name;
++        const bool named = LLAvatarNameCache::get(ids[i], &name);
++        const F64 distance = (positions[i] - gAgent.getPositionGlobal()).length();
++        entries.push_back({ids[i], distance, named ? name.getDisplayName() : ids[i].asString(), targetAvatar(ids[i]) != nullptr});
++    }
++    std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b)
++    { return a.distance < b.distance || (a.distance == b.distance && a.id < b.id); });
++    for (const auto& e : entries)
++    {
++        LLSD row;
++        row["id"] = e.id;
++        row["columns"][0]["column"] = "name";
++        row["columns"][0]["value"] = e.name;
++        row["columns"][1]["column"] = "distance";
++        row["columns"][1]["value"] = llformat("%.1f m", e.distance);
++        row["columns"][2]["column"] = "loaded";
++        row["columns"][2]["value"] = e.loaded ? "Bereit" : "Nicht geladen";
++        mList->addElement(row);
++    }
++    if (selected.notNull()) mList->selectByID(selected);
++    mRefreshing = false;
++    mRefreshTimer.reset();
++}
++void FSFloaterTargetLock::selectTarget()
++{
++    if (mRefreshing) return;
++    const LLUUID id = mList->getSelectedValue().asUUID();
++    LLVOAvatar* av = targetAvatar(id);
++    if (id.isNull() || id == gAgent.getID() || !av || !gAgent.getRegion() ||
++        av->getRegion() != gAgent.getRegion())
++    {
++        getChild<LLTextBox>("status")->setText(std::string("Ziel muss geladen und in derselben Region sein."));
++        return;
++    }
++    stop();
++    target_id = id;
++    source_region = gAgent.getRegion()->getRegionID();
++    was_mouselook = false;
++    getChild<LLTextBox>("status")->setText(std::string("Ziel aktiv. F8: STOP | F9: anderes Ziel"));
++    setVisible(false);
++    gFocusMgr.setKeyboardFocus(nullptr);
++    gAgentCamera.changeCameraToMouselook(false);
++    if (!gAgentCamera.cameraMouselook())
++    {
++        stop();
++        setVisible(true);
++        getChild<LLTextBox>("status")->setText(std::string("Mouselook konnte nicht aktiviert werden."));
++    }
++}
++void FSFloaterTargetLock::openSelector()
++{
++    stop();
++    if (gAgentCamera.cameraMouselook()) gAgentCamera.changeCameraToThirdPerson();
++    LLFloaterReg::showInstance("fs_target_lock");
++}
++void FSFloaterTargetLock::stop()
++{
++    target_id.setNull();
++    source_region.setNull();
++    was_mouselook = false;
++}
++bool FSFloaterTargetLock::active() { return target_id.notNull(); }
++bool FSFloaterTargetLock::applyFocus(const LLVector3& eye, LLVector3& focus, LLVector3& up)
++{
++    if (!active()) return false;
++    if (!gFocusMgr.getAppHasFocus() || !gAgent.getRegion() ||
++        gAgent.getRegion()->getRegionID() != source_region ||
++        gAgent.getTeleportState() != LLAgent::TELEPORT_NONE || !isAgentAvatarValid())
++    { stop(); return false; }
++    if (!gAgentCamera.cameraMouselook())
++    {
++        if (was_mouselook) stop();
++        return false;
++    }
++    was_mouselook = true;
++    LLVOAvatar* av = targetAvatar(target_id);
++    if (!av || !av->getRegion() || av->getRegion() != gAgent.getRegion())
++    { stop(); return false; }
++    // Upper torso, in the same agent coordinates as the final rendered eye.
++    LLVector3 aim = av->getPositionAgent();
++    aim.mV[VZ] += 0.35f;
++    TayoriAim::Vec direction;
++    if (!TayoriAim::direction({eye.mV[0],eye.mV[1],eye.mV[2]},
++                             {aim.mV[0],aim.mV[1],aim.mV[2]}, direction))
++    { stop(); return false; }
++    LLVector3 at((F32)direction[0], (F32)direction[1], (F32)direction[2]);
++    focus = aim;
++    up = fabs(at.mV[VZ]) > .999f ? LLVector3::y_axis : LLVector3::z_axis;
++    // Keep the agent's own aim frame in agreement, including a seated parent's rotation.
++    if (gAgentAvatarp->getParent())
++    {
++        auto* parent = static_cast<LLViewerObject*>(gAgentAvatarp->getParent());
++        if (!parent->flagCameraDecoupled()) at = at * ~parent->getRenderRotation();
++    }
++    // resetAxes rejects a perfectly vertical look vector. The rendered focus remains exact.
++    if ((at % gAgent.getReferenceUpVector()).isNull())
++    { at.mV[VX] += .00001f; at.normalize(); }
++    gAgent.resetAxes(at);
++    return true;
++}
+diff --git a/indra/newview/fsfloatertargetlock.h b/indra/newview/fsfloatertargetlock.h
+new file mode 100644
+index 0000000..a5d5dcf
+--- /dev/null
++++ b/indra/newview/fsfloatertargetlock.h
+@@ -0,0 +1,30 @@
++// SPDX-License-Identifier: LGPL-2.1-only
++// Independently authored Tayori Mouselook prototype, 2026.
++#ifndef FS_FLOATER_TARGET_LOCK_H
++#define FS_FLOATER_TARGET_LOCK_H
++#include "llfloater.h"
++#include "lltimer.h"
++class LLScrollListCtrl;
++class LLVector3;
++
++class FSFloaterTargetLock final : public LLFloater
++{
++public:
++    explicit FSFloaterTargetLock(const LLSD& key);
++    bool postBuild() override;
++    void draw() override;
++    void onOpen(const LLSD& key) override;
++    void onClose(bool app_quitting) override;
++    static void openSelector();
++    static void stop();
++    // Called once per camera frame, after camera origin smoothing.
++    static bool applyFocus(const LLVector3& eye, LLVector3& focus, LLVector3& up);
++    static bool active();
++private:
++    void refresh();
++    void selectTarget();
++    LLScrollListCtrl* mList = nullptr;
++    LLTimer mRefreshTimer;
++    bool mRefreshing = false;
++};
++#endif
+diff --git a/indra/newview/llagent.cpp b/indra/newview/llagent.cpp
+index af6f80a..f8dd394 100644
+--- a/indra/newview/llagent.cpp
++++ b/indra/newview/llagent.cpp
+@@ -28,6 +28,7 @@
+ #include "llviewerprecompiledheaders.h"
+ 
+ #include "llagent.h"
++#include "fsfloatertargetlock.h"
+ 
+ #include "pipeline.h"
+ 
+@@ -5557,6 +5558,7 @@ LLAgent::ETeleportState LLAgent::getTeleportState() const
+ 
+ void LLAgent::setTeleportState(ETeleportState state)
+ {
++    if (state != TELEPORT_NONE) FSFloaterTargetLock::stop();
+     if (mTeleportRequest && (state != TELEPORT_NONE) && (mTeleportRequest->getStatus() == LLTeleportRequest::kFailed))
+     {   // A late message has come in regarding a failed teleport.
+         // We have already decided that it failed so should not reinitiate the teleport sequence in the viewer.
+diff --git a/indra/newview/llagentcamera.cpp b/indra/newview/llagentcamera.cpp
+index 5b440e8..783f9aa 100644
+--- a/indra/newview/llagentcamera.cpp
++++ b/indra/newview/llagentcamera.cpp
+@@ -26,6 +26,7 @@
+ 
+ #include "llviewerprecompiledheaders.h"
+ #include "llagentcamera.h"
++#include "fsfloatertargetlock.h"
+ 
+ #include "pipeline.h"
+ 
+@@ -1625,6 +1626,9 @@ void LLAgentCamera::updateCamera()
+     LLVector3 focus_agent = gAgent.getPosAgentFromGlobal(mFocusGlobal);
+     LLVector3 position_agent = gAgent.getPosAgentFromGlobal(camera_pos_global);
+ 
++    // Final eye position is known: lock both pitch and yaw before rendering.
++    FSFloaterTargetLock::applyFocus(position_agent, focus_agent, mCameraUpVector);
++
+     // Try to move the camera
+ 
+     if (!LLViewerCamera::getInstance()->updateCameraLocation(position_agent, mCameraUpVector, focus_agent))
+diff --git a/indra/newview/llviewerfloaterreg.cpp b/indra/newview/llviewerfloaterreg.cpp
+index dfe9cdf..5f9c08a 100644
+--- a/indra/newview/llviewerfloaterreg.cpp
++++ b/indra/newview/llviewerfloaterreg.cpp
+@@ -214,6 +214,7 @@
+ #include "fsfloaterposestand.h"
+ #include "fsfloaterprotectedfolders.h"
+ #include "fsfloaterradar.h"
++#include "fsfloatertargetlock.h"
+ #include "fsfloatersearch.h"
+ #include "fsfloatersplashscreensettings.h"
+ #include "fsfloaterstatistics.h"
+@@ -652,6 +653,7 @@ void LLViewerFloaterReg::registerFloaters()
+     LLFloaterReg::add("fs_placedetails", "floater_fs_placedetails.xml", (LLFloaterBuildFunc)&LLFloaterReg::build<FSFloaterPlaceDetails>);
+     LLFloaterReg::add("fs_poser", "floater_fs_poser.xml", (LLFloaterBuildFunc)&LLFloaterReg::build<FSFloaterPoser>); // <FS:AR> [FIRE-30873]: Poser
+     LLFloaterReg::add("fs_protectedfolders", "floater_fs_protectedfolders.xml", (LLFloaterBuildFunc)&LLFloaterReg::build<FSFloaterProtectedFolders>);
++    LLFloaterReg::add("fs_target_lock", "floater_fs_target_lock.xml", (LLFloaterBuildFunc)&LLFloaterReg::build<FSFloaterTargetLock>);
+     LLFloaterReg::add("fs_radar", "floater_fs_radar.xml", (LLFloaterBuildFunc)&LLFloaterReg::build<FSFloaterRadar>);
+     LLFloaterReg::add("fs_splash_screen_settings", "floater_fs_splash_screen_settings.xml", (LLFloaterBuildFunc)&LLFloaterReg::build<FSFloaterSplashScreenSettings>);
+     LLFloaterReg::add("fs_streamtitle", "floater_fs_streamtitle.xml", (LLFloaterBuildFunc)&LLFloaterReg::build<FSFloaterStreamTitle>);
+diff --git a/indra/newview/llviewerwindow.cpp b/indra/newview/llviewerwindow.cpp
+index 2b2e105..785227c 100644
+--- a/indra/newview/llviewerwindow.cpp
++++ b/indra/newview/llviewerwindow.cpp
+@@ -26,6 +26,7 @@
+ 
+ #include "llviewerprecompiledheaders.h"
+ #include "llviewerwindow.h"
++#include "fsfloatertargetlock.h"
+ 
+ 
+ // system library includes
+@@ -1692,6 +1693,7 @@ void LLViewerWindow::handleFocus(LLWindow *window)
+ // The top-level window has lost focus (e.g. via ALT-TAB)
+ void LLViewerWindow::handleFocusLost(LLWindow *window)
+ {
++    FSFloaterTargetLock::stop();
+     gFocusMgr.setAppHasFocus(false);
+     //LLModalDialog::onAppFocusLost();
+     LLToolMgr::getInstance()->onAppFocusLost();
+@@ -1722,6 +1724,18 @@ void LLViewerWindow::handleFocusLost(LLWindow *window)
+ 
+ bool LLViewerWindow::handleTranslatedKeyDown(KEY key,  MASK mask, bool repeated)
+ {
++    // Local emergency stop is handled before gestures and control remapping.
++    if (key == KEY_F8 && mask == MASK_NONE && FSFloaterTargetLock::active())
++    {
++        FSFloaterTargetLock::stop();
++        return true;
++    }
++    if (key == KEY_F9 && mask == MASK_NONE)
++    {
++        if (!repeated) FSFloaterTargetLock::openSelector();
++        return true;
++    }
++
+     // Handle non-consuming global keybindings, like voice
+     // Never affects event processing.
+     gViewerInput.handleGlobalBindsKeyDown(key, mask);
+diff --git a/indra/newview/skins/default/xui/en/floater_fs_target_lock.xml b/indra/newview/skins/default/xui/en/floater_fs_target_lock.xml
+new file mode 100644
+index 0000000..a16d0ef
+--- /dev/null
++++ b/indra/newview/skins/default/xui/en/floater_fs_target_lock.xml
+@@ -0,0 +1,18 @@
++<?xml version="1.0" encoding="utf-8" standalone="yes"?>
++<floater name="fs_target_lock" title="Tayori - Mouselook-Ziel" width="540" height="420"
++ layout="topleft" can_resize="false" can_minimize="true" can_close="true" save_rect="true"
++ reuse_instance="true" single_instance="true">
++ <text name="intro" left="15" top="28" width="510" height="35" wrap="true">
++  Avatar anklicken: im echten Mouselook verfolgen. Liste alle 5 Sekunden, Umkreis 96 m.
++ </text>
++ <scroll_list name="targets" left="15" top="70" width="510" height="265"
++  draw_heading="true" multi_select="false">
++  <column name="name" label="Anzeigename" width="300"/>
++  <column name="distance" label="Entfernung" width="80"/>
++  <column name="loaded" label="Status" width="110"/>
++ </scroll_list>
++ <text name="status" left="15" top="343" width="510" height="25">
++  F8: STOP | F9: Zielauswahl | Esc: Mouselook verlassen
++ </text>
++ <button name="stop" label="STOP" left="15" top="375" width="120" height="25"/>
++</floater>
+diff --git a/indra/newview/skins/default/xui/en/menu_viewer.xml b/indra/newview/skins/default/xui/en/menu_viewer.xml
+index a37c1f6..961acfc 100644
+--- a/indra/newview/skins/default/xui/en/menu_viewer.xml
++++ b/indra/newview/skins/default/xui/en/menu_viewer.xml
+@@ -647,6 +647,9 @@
+              parameter="preferences" />
+         </menu_item_call>
+         
++        <menu_item_call label="Tayori Mouselook-Ziel (F9)" name="TayoriTargetLock">
++            <menu_item_call.on_click function="Floater.Show" parameter="fs_target_lock" />
++        </menu_item_call>
+         <menu_item_call
+          label="Toolbar Buttons"
+          name="Toolbar Buttons">
+diff --git a/indra/newview/tayoriaim.h b/indra/newview/tayoriaim.h
+new file mode 100644
+index 0000000..66005d0
+--- /dev/null
++++ b/indra/newview/tayoriaim.h
+@@ -0,0 +1,24 @@
++// SPDX-License-Identifier: LGPL-2.1-only
++// Independently authored target-lock geometry, 2026.
++#ifndef TAYORI_AIM_H
++#define TAYORI_AIM_H
++#include <array>
++#include <cmath>
++namespace TayoriAim
++{
++using Vec = std::array<double, 3>;
++inline bool direction(const Vec& eye, const Vec& target, Vec& out)
++{
++    Vec d{};
++    for (int i = 0; i < 3; ++i)
++    {
++        if (!std::isfinite(eye[i]) || !std::isfinite(target[i])) return false;
++        d[i] = target[i] - eye[i];
++    }
++    const double length = std::hypot(d[0], d[1], d[2]);
++    if (!std::isfinite(length) || length < 0.05) return false;
++    for (int i = 0; i < 3; ++i) out[i] = d[i] / length;
++    return true;
++}
++}
++#endif
