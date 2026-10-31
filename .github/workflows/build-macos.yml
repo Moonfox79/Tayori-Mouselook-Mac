@@ -1,0 +1,64 @@
+name: Tayori Mac bauen
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tayori-mac-build
+  cancel-in-progress: false
+
+jobs:
+  mac:
+    # No paid/private-repository build is started by this workflow.
+    if: github.event.repository.private == false
+    runs-on: macos-15-intel
+    timeout-minutes: 330
+    env:
+      AUTOBUILD_CPU_COUNT: '2'
+      CMAKE_BUILD_PARALLEL_LEVEL: '2'
+    steps:
+      - name: Projekt laden
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Xcode und Werkzeuge pruefen
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d /Applications/Xcode_16.4.app
+          echo 'DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer' >> "$GITHUB_ENV"
+          /Applications/Xcode_16.4.app/Contents/Developer/usr/bin/xcodebuild -version
+          cmake --version
+          git --version
+          df -h "$RUNNER_TEMP"
+      - name: Viewer bauen und Paket pruefen
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          python -u build_macos.py 2>&1 | tee logs/mac-build.log
+      - name: Mac-Downloadpaket sichern
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Tayori-Mouselook-Mac-Universal
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - name: Protokolle sichern
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Tayori-Mac-Buildprotokolle
+          path: |
+            logs/
+            ${{ runner.temp }}/tayori-mac-build/source/build-darwin-universal/logs/
+          if-no-files-found: ignore
+          retention-days: 3
