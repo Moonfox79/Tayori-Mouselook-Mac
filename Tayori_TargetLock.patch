@@ -202,7 +202,7 @@ index 0000000..999007a
 +}
 diff --git a/indra/newview/fsfloatertargetlock.h b/indra/newview/fsfloatertargetlock.h
 new file mode 100644
-index 0000000..a5d5dcf
+index 0000000..bd2723e
 --- /dev/null
 +++ b/indra/newview/fsfloatertargetlock.h
 @@ -0,0 +1,30 @@
@@ -229,7 +229,7 @@ index 0000000..a5d5dcf
 +    static bool applyFocus(const LLVector3& eye, LLVector3& focus, LLVector3& up);
 +    static bool active();
 +private:
-+    void refresh();
++    void refresh() override;
 +    void selectTarget();
 +    LLScrollListCtrl* mList = nullptr;
 +    LLTimer mRefreshTimer;
